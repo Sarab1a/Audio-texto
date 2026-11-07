@@ -13,6 +13,7 @@ import pyttsx3
 import PyPDF2
 import threading
 import shutil
+import locale
 import os
 import re
 import sys
@@ -69,6 +70,109 @@ def idioma_ocr():
         return None
     elegidos = [i for i in ("spa", "eng") if i in idiomas]
     return "+".join(elegidos) if elegidos else None
+
+
+# --- Voces ---
+# Windows guarda las voces en dos lugares. pyttsx3 solo ve el antiguo (normalmente
+# solo voces en inglés); las voces en español suelen estar en el moderno ("OneCore").
+VOCES_ONECORE = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech_OneCore\Voices"
+
+NOMBRES_FEMENINOS = ['zira', 'helena', 'sabina', 'paulina', 'monica', 'mónica', 'laura', 'dalia',
+                     'elvira', 'hazel', 'susan', 'female', 'mujer']
+NOMBRES_MASCULINOS = ['david', 'pablo', 'jorge', 'juan', 'diego', 'raul', 'raúl', 'mark', 'george',
+                      'male', 'hombre']
+
+PAISES = {'mx': 'México', 'es': 'España', '419': 'Latinoamérica', 'us': 'EE. UU.', 'gb': 'Reino Unido',
+          'ar': 'Argentina', 'co': 'Colombia', 'cl': 'Chile', 'ca': 'Canadá', 'au': 'Australia', 'in': 'India'}
+
+
+def lcid_a_codigo(lcid):
+    """Convierte el código de idioma de Windows (ej. '80A') a texto (ej. 'es-MX')."""
+    try:
+        return locale.windows_locale[int(str(lcid).split(';')[0], 16)].replace('_', '-')
+    except (ValueError, KeyError):
+        return ''
+
+
+def voces_onecore():
+    """Lista las voces modernas de Windows (ahí suelen estar las voces en español)."""
+    if sys.platform != 'win32':
+        return []
+    voces = []
+    try:
+        import comtypes.client
+        categoria = comtypes.client.CreateObject("SAPI.SpObjectTokenCategory")
+        categoria.SetId(VOCES_ONECORE, False)
+        tokens = categoria.EnumerateTokens()
+        for i in range(tokens.Count):
+            try:
+                token = tokens.Item(i)
+                voces.append({
+                    'id': token.Id,
+                    'nombre': token.GetDescription(),
+                    'genero': token.GetAttribute("Gender"),
+                    'idioma': lcid_a_codigo(token.GetAttribute("Language")),
+                })
+            except Exception:
+                continue
+    except Exception as e:
+        print("No se pudieron leer las voces modernas de Windows:", e)
+    return voces
+
+
+def asignar_voz(engine, voz_id):
+    """Selecciona la voz en el motor. Las voces modernas de Windows se asignan directo a SAPI."""
+    if 'Speech_OneCore' not in voz_id:
+        engine.setProperty('voice', voz_id)
+        return
+    import comtypes.client
+    categoria = comtypes.client.CreateObject("SAPI.SpObjectTokenCategory")
+    categoria.SetId(voz_id.split('\\Tokens\\')[0], False)
+    tokens = categoria.EnumerateTokens()
+    for i in range(tokens.Count):
+        token = tokens.Item(i)
+        if token.Id == voz_id:
+            engine.proxy._driver._tts.Voice = token
+            return
+    raise ValueError(f"No se encontró la voz {voz_id}")
+
+
+def idioma_legible(codigo, nombre):
+    """Devuelve 'Español (México)', 'Inglés (EE. UU.)', etc. None si es otro idioma."""
+    if isinstance(codigo, bytes):
+        codigo = codigo.decode('utf-8', 'ignore')
+    codigo = re.sub(r'[^\w-]', '', str(codigo or '')).lower().replace('_', '-')
+    nombre_min = nombre.lower()
+    base = codigo.split('-')[0]
+    if base == 'es' or 'spanish' in nombre_min or 'español' in nombre_min:
+        idioma = "Español"
+    elif base == 'en' or 'english' in nombre_min:
+        idioma = "Inglés"
+    else:
+        return None
+    region = codigo.split('-')[1] if '-' in codigo else ''
+    if not region and 'mexico' in nombre_min:
+        region = 'mx'
+    if region in PAISES:
+        idioma += f" ({PAISES[region]})"
+    return idioma
+
+
+def persona_de_voz(genero, nombre):
+    """'Carolina' para voces femeninas, 'Flavio' para masculinas, None si no se sabe."""
+    genero = (genero or '').lower()
+    nombre_min = nombre.lower()
+    if genero == 'female' or any(x in nombre_min for x in NOMBRES_FEMENINOS):
+        return "Carolina"
+    if genero == 'male' or any(x in nombre_min for x in NOMBRES_MASCULINOS):
+        return "Flavio"
+    return None
+
+
+def nombre_corto(nombre):
+    """'Microsoft Sabina Desktop - Spanish (Mexico)' -> 'Sabina'"""
+    corto = nombre.split(' - ')[0].replace('Microsoft ', '').replace(' Desktop', '').strip()
+    return corto or nombre
 
 
 def limites_palabra(texto, posicion):
@@ -192,40 +296,59 @@ class AudioTextoApp:
     # Voces
     # ------------------------------------------------------------------
     def cargar_voces(self):
-        """Carga las voces y renombra las femeninas a Carolina y masculinas a Flavio"""
+        """
+        Carga las voces y las nombra por género e idioma:
+        Carolina (femeninas) y Flavio (masculinas), en español o inglés.
+        """
         engine_temp = pyttsx3.init()
-        voces = engine_temp.getProperty('voices')
+        candidatas = []
+        for voz in engine_temp.getProperty('voices'):
+            idiomas = getattr(voz, 'languages', None) or ['']
+            candidatas.append({'id': voz.id, 'nombre': voz.name,
+                               'genero': getattr(voz, 'gender', None), 'idioma': idiomas[0]})
+        # En Windows, sumar las voces modernas (donde suelen estar las de español)
+        candidatas += voces_onecore()
 
-        # Nombres de voces comunes en Windows, macOS y Linux (eSpeak)
-        femeninas = ['zira', 'helena', 'sabina', 'paulina', 'monica', 'mónica', 'laura', 'dalia', 'female', 'mujer']
-        masculinas = ['david', 'pablo', 'jorge', 'juan', 'diego', 'raul', 'raúl', 'male', 'hombre']
+        orden_idioma = {"Español": 0, "Inglés": 1}
+        orden_persona = {"Carolina": 0, "Flavio": 1}
+        entradas = []
+        vistas = set()
+        for voz in candidatas:
+            corto = nombre_corto(voz['nombre'])
+            idioma = idioma_legible(voz['idioma'], voz['nombre'])
+            persona = persona_de_voz(voz['genero'], voz['nombre'])
 
-        for voz in voces:
-            nombre_original = voz.name
-            nombre_mostrar = nombre_original
-            nombre_min = nombre_original.lower()
-            genero = (getattr(voz, 'gender', None) or '').lower()
+            if persona and idioma:
+                nombre_mostrar = f"{persona} · {idioma} – {corto}"
+            elif persona:
+                nombre_mostrar = f"{persona} – {voz['nombre']}"
+            else:
+                nombre_mostrar = voz['nombre']
 
-            # Detectar si es voz femenina para llamarla Carolina
-            if genero == 'female' or any(x in nombre_min for x in femeninas):
-                nombre_mostrar = f"Carolina ({nombre_original})"
-            # Detectar si es voz masculina para llamarla Flavio
-            elif genero == 'male' or any(x in nombre_min for x in masculinas):
-                nombre_mostrar = f"Flavio ({nombre_original})"
+            # La misma voz puede aparecer en los dos lugares de Windows: dejar solo una
+            if nombre_mostrar in vistas:
+                continue
+            vistas.add(nombre_mostrar)
+            clave = (orden_idioma.get((idioma or '').split(' ')[0], 2), orden_persona.get(persona, 2), nombre_mostrar)
+            entradas.append((clave, nombre_mostrar, voz['id']))
 
-            self.voces_dict[nombre_mostrar] = voz.id
-
+        for _, nombre_mostrar, voz_id in sorted(entradas):
+            self.voces_dict[nombre_mostrar] = voz_id
         self.combo_voces['values'] = list(self.voces_dict.keys())
 
-        # Seleccionar a "Carolina" por defecto si existe
-        for nombre in self.voces_dict.keys():
-            if "Carolina" in nombre:
-                self.combo_voces.set(nombre)
-                break
+        # Por defecto: Carolina en español; si no hay, cualquier Carolina; si no, la primera
+        nombres = list(self.voces_dict.keys())
+        preferida = (next((n for n in nombres if n.startswith("Carolina · Español")), None)
+                     or next((n for n in nombres if n.startswith("Carolina")), None)
+                     or (nombres[0] if nombres else None))
+        if preferida:
+            self.combo_voces.set(preferida)
 
-        # Si no hay Carolina, seleccionar la primera disponible
-        if not self.combo_voces.get() and self.combo_voces['values']:
-            self.combo_voces.set(self.combo_voces['values'][0])
+        if not any("· Español" in n for n in nombres):
+            if sys.platform == 'win32':
+                self._estado("No hay voces en español. Agrégalas en Configuración → Hora e idioma → Voz → Agregar voces.")
+            else:
+                self._estado("No se encontraron voces en español en este equipo.")
 
     # ------------------------------------------------------------------
     # Carga de archivos
@@ -376,7 +499,11 @@ class AudioTextoApp:
         try:
             engine = pyttsx3.init()
             if voz_id:
-                engine.setProperty('voice', voz_id)
+                try:
+                    asignar_voz(engine, voz_id)
+                except Exception as e:
+                    print("No se pudo usar la voz elegida:", e)
+                    self.root.after(0, self._estado, "No se pudo usar esa voz; se usa la predeterminada.")
             engine.setProperty('rate', velocidad)
 
             # Este "sensor" se activa antes de que el motor diga cada palabra.
