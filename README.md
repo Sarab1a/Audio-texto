@@ -1,25 +1,72 @@
-# Audio-texto.
+# AudioTexto v2
 
-AudioTexto v2
+Lector de texto en voz alta. Abre archivos PDF o TXT (o pega tu propio texto) y el programa lo lee con las voces instaladas en tu computadora.
 
-Notas:
+![Demostración de AudioTexto](Foto%20de%20demostraci%C3%B3n..png)
 
-Esta versión trabaja solo para Windows. Espero la v3 tenga soporte para Android y IOS.
+## Funciones
 
-Instalación y Uso
+- **Abrir PDF y TXT**, o pegar texto directamente en la ventana.
+- **Leer, pausar y reanudar**: al pausar, la lectura continúa desde la misma palabra. "Detener" regresa al inicio.
+- **Leer desde cualquier punto**: haz clic en el texto y presiona "Leer".
+- **Control de velocidad**: deslizador de 80 a 300. Puedes cambiarlo mientras lee.
+- **Selección de voz**: las voces femeninas aparecen como "Carolina" y las masculinas como "Flavio".
+- **Resaltado**: la palabra que se está leyendo se marca en amarillo y la vista la sigue.
+- **PDF escaneados (OCR)**: reconoce el texto de páginas que son imágenes (requiere instalación adicional, ver abajo).
+- Omite los enlaces web para no leerlos.
 
-Para ejecutar este proyecto en tu computadora, asegúrate de tener Python instalado. Luego, sigue estos pasos:
+## Requisitos
 
-Descarga los archivos, todos en alguna carpeta.
+- Python 3.
+- Windows, macOS o Linux. Android e iOS aún no tienen soporte; espero agregarlo en la v3.
 
-Abre tu terminal o Visual Studio Code para poder ejecutarlo. 
+## Instalación
 
-Instala las dependencias necesarias ejecutando el siguiente comando: Para que este programa funcione correctamente en la computadora, solo necesitas abrir tu terminal (o símbolo del sistema/CMD) y copiar y pegar este único comando para instalar todo lo necesario:
+1. Descarga los archivos en una carpeta.
+2. Abre tu terminal (CMD en Windows) o Visual Studio Code.
+3. Instala las dependencias con este comando:
 
-pip install pyttsx3 PyPDF2 pywin32
+   ```
+   pip install pyttsx3 PyPDF2 pywin32
+   ```
 
-Una vez instalado, simplemente ejecuta el archivo AudioTexto_v1.py
+   En macOS y Linux no hace falta `pywin32`:
 
-NOTA: Al momento de ejecutar por terminal, veirifica que tengas la ruta en donde está en archivo .py
+   ```
+   pip install pyttsx3 PyPDF2
+   ```
 
-Caso contrario, desde el cmd indica "C" y la dirección donde tengas el archivo .py
+4. **Solo Linux:** instala el motor de voz y el reproductor de audio:
+
+   ```
+   sudo apt install espeak-ng alsa-utils
+   ```
+
+### Opcional: leer PDF escaneados (OCR)
+
+Sin esto el programa funciona igual; solo no podrá leer páginas escaneadas.
+
+1. Instala las librerías:
+
+   ```
+   pip install pymupdf pytesseract
+   ```
+
+2. Instala el programa **Tesseract-OCR** con el idioma **español**:
+   - Windows: descarga el instalador de Tesseract y, durante la instalación, marca el idioma "Spanish".
+   - macOS: `brew install tesseract tesseract-lang`
+   - Linux: `sudo apt install tesseract-ocr tesseract-ocr-spa`
+
+## Uso
+
+Ejecuta el programa con:
+
+```
+python audio_lector.py
+```
+
+**Nota:** en la terminal, primero ubícate en la carpeta donde está el archivo `.py`. Por ejemplo:
+
+```
+cd C:\Users\TuUsuario\Descargas\Audio-texto
+```
