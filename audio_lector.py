@@ -368,11 +368,11 @@ class AudioTextoApp:
         # Se coloca antes del área de texto para que siempre quede visible
         bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=15, pady=5)
 
-        lbl_dedicatoria = tk.Label(bottom_frame, text="Creado con amor para Carolina ❤️",
+        lbl_dedicatoria = tk.Label(bottom_frame, text=".....",
                                    bg=COLOR_FONDO, fg="#ec4899", font=("Segoe UI", 10, "italic"))
         lbl_dedicatoria.pack(side=tk.RIGHT)
 
-        lbl_autor = tk.Label(bottom_frame, text="Atte: Flavio",
+        lbl_autor = tk.Label(bottom_frame, text="By: Flavio and support of Opus",
                                    bg=COLOR_FONDO, fg="#64748b", font=("Segoe UI", 9))
         lbl_autor.pack(side=tk.LEFT)
 
