@@ -12,11 +12,26 @@ from tkinter import filedialog, messagebox, ttk
 import pyttsx3
 import PyPDF2
 import threading
+import concurrent.futures
+import asyncio
 import shutil
 import locale
+import time
+import io
 import os
 import re
 import sys
+
+# --- Voces en línea (opcional) ---
+# Requiere: pip install edge-tts pygame-ce  y conexión a internet.
+# Si no hay internet (o faltan estas librerías) se usan las voces de la computadora.
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+try:
+    import edge_tts
+    import pygame
+    EN_LINEA_LIBRERIAS = True
+except ImportError:
+    EN_LINEA_LIBRERIAS = False
 
 # --- OCR opcional (para PDF escaneados) ---
 # Requiere: pip install pymupdf pytesseract  +  el programa Tesseract-OCR instalado.
@@ -175,6 +190,92 @@ def nombre_corto(nombre):
     return corto or nombre
 
 
+# --- Voces en línea ---
+PREFIJO_EN_LINEA = "en_linea:"
+VOCES_EN_LINEA = [
+    ("Carolina · Español (México) – Dalia (en línea)", "es-MX-DaliaNeural"),
+    ("Flavio · Español (México) – Jorge (en línea)", "es-MX-JorgeNeural"),
+    ("Carolina · Inglés (EE. UU.) – Jenny (en línea)", "en-US-JennyNeural"),
+    ("Flavio · Inglés (EE. UU.) – Guy (en línea)", "en-US-GuyNeural"),
+]
+# Respeta el proxy del sistema si existe (redes de escuela u oficina)
+PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
+
+
+def hay_conexion():
+    """Comprueba si el servidor de voces en línea responde."""
+    async def _probar():
+        await asyncio.wait_for(edge_tts.list_voices(proxy=PROXY), timeout=8)
+    try:
+        asyncio.run(_probar())
+        return True
+    except Exception:
+        return False
+
+
+def velocidad_a_porcentaje(velocidad):
+    """El deslizador va de 80 a 300 (160 = normal). Las voces en línea usan porcentaje."""
+    return f"{round((velocidad / 160 - 1) * 100):+d}%"
+
+
+def sintetizar_en_linea(texto, voz, velocidad):
+    """
+    Genera el audio de un fragmento con una voz en línea.
+    Devuelve (audio_mp3, palabras), donde palabras = [(milisegundo, palabra), ...].
+    """
+    async def _generar():
+        comunicador = edge_tts.Communicate(texto, voz, rate=velocidad_a_porcentaje(velocidad),
+                                           boundary="WordBoundary", proxy=PROXY,
+                                           connect_timeout=8, receive_timeout=30)
+        audio = bytearray()
+        palabras = []
+        async for parte in comunicador.stream():
+            if parte["type"] == "audio":
+                audio.extend(parte["data"])
+            elif parte["type"] == "WordBoundary":
+                # El tiempo viene en unidades de 100 nanosegundos
+                palabras.append((parte["offset"] / 10000, parte["text"]))
+        return bytes(audio), palabras
+    return asyncio.run(_generar())
+
+
+def dividir_en_fragmentos(texto, inicio, primero=300, resto=1500):
+    """
+    Divide el texto (desde 'inicio') en fragmentos que terminan en fin de oración o de línea.
+    El primero es corto para que la lectura empiece rápido; mientras suena uno, se prepara el siguiente.
+    Devuelve una lista de (inicio, fin).
+    """
+    fragmentos = []
+    pos = inicio
+    limite = primero
+    while pos < len(texto):
+        fin = min(pos + limite, len(texto))
+        if fin < len(texto):
+            corte = max(texto.rfind(sep, pos, fin) for sep in (". ", "? ", "! ", "\n", "; ", ": "))
+            if corte <= pos:
+                corte = texto.rfind(" ", pos, fin)
+            if corte > pos:
+                fin = corte + 1
+        if any(c.isalnum() for c in texto[pos:fin]):
+            fragmentos.append((pos, fin))
+        pos = fin
+        limite = resto
+    return fragmentos
+
+
+def ubicar_palabras(texto, inicio, fin, palabras):
+    """Convierte [(ms, palabra)] en [(ms, posición, largo)] buscando cada palabra en el texto."""
+    resultado = []
+    cursor = inicio
+    for ms, palabra in palabras:
+        idx = texto.find(palabra, cursor, fin)
+        if idx == -1:
+            continue
+        resultado.append((ms, idx, len(palabra)))
+        cursor = idx + len(palabra)
+    return resultado
+
+
 def limites_palabra(texto, posicion):
     """
     Devuelve (inicio, largo) de la palabra completa en esa posición.
@@ -200,7 +301,7 @@ class AudioTextoApp:
     def __init__(self, root):
         self.root = root
         self.root.title("AudioTexto v2 - Carolina Edition")
-        self.root.geometry("800x600")
+        self.root.geometry("960x640")
         self.root.configure(bg=COLOR_FONDO)
 
         # Variables de control
@@ -209,9 +310,12 @@ class AudioTextoApp:
         self.accion = None           # Qué pidió el usuario al cortar: 'pausa', 'detener' o 'reiniciar'
         self.pos_actual = 0          # Posición (en caracteres) de la palabra que se está leyendo
         self.voces_dict = {}
+        self.aviso_voces = ""             # Aviso si no hay voces en español en la computadora
+        self.voz_elegida_por_usuario = False
 
         self.crear_interfaz()
         self.cargar_voces()
+        self._buscar_voces_en_linea()
 
     # ------------------------------------------------------------------
     # Interfaz
@@ -228,10 +332,10 @@ class AudioTextoApp:
 
         # Selector de Voz
         tk.Label(top_frame, text="Voz:", bg=COLOR_FONDO, font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=5)
-        self.combo_voces = ttk.Combobox(top_frame, state="readonly", width=35, font=("Segoe UI", 10))
+        self.combo_voces = ttk.Combobox(top_frame, state="readonly", width=44, font=("Segoe UI", 10))
         self.combo_voces.pack(side=tk.LEFT, padx=5)
         # Si cambias de voz mientras lee, continúa con la nueva voz
-        self.combo_voces.bind("<<ComboboxSelected>>", lambda e: self._reiniciar_si_lee())
+        self.combo_voces.bind("<<ComboboxSelected>>", lambda e: self._al_elegir_voz())
 
         # Botones de Reproducción
         self.btn_play = tk.Button(top_frame, text="▶ Leer", command=self.alternar_lectura,
@@ -259,24 +363,10 @@ class AudioTextoApp:
         tk.Label(speed_frame, text="Tip: haz clic en el texto para empezar a leer desde ahí.",
                  bg=COLOR_FONDO, fg="#64748b", font=("Segoe UI", 9)).pack(side=tk.RIGHT, padx=5)
 
-        # --- Área de Texto Principal ---
-        text_frame = tk.Frame(self.root)
-        text_frame.pack(expand=True, fill=tk.BOTH, padx=15, pady=5)
-
-        scrollbar = tk.Scrollbar(text_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.text_area = tk.Text(text_frame, wrap=tk.WORD, font=("Georgia", 13),
-                                 yscrollcommand=scrollbar.set, relief="flat", padx=10, pady=10)
-        self.text_area.pack(expand=True, fill=tk.BOTH)
-        scrollbar.config(command=self.text_area.yview)
-
-        # Estilo para la palabra que se está leyendo
-        self.text_area.tag_configure("leyendo", background="#fde68a", foreground="#1e293b")
-
         # --- Marco inferior (Estado y mensaje especial) ---
         bottom_frame = tk.Frame(self.root, bg=COLOR_FONDO)
-        bottom_frame.pack(fill=tk.X, padx=15, pady=5)
+        # Se coloca antes del área de texto para que siempre quede visible
+        bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=15, pady=5)
 
         lbl_dedicatoria = tk.Label(bottom_frame, text="Creado con amor para Carolina ❤️",
                                    bg=COLOR_FONDO, fg="#ec4899", font=("Segoe UI", 10, "italic"))
@@ -288,6 +378,21 @@ class AudioTextoApp:
 
         self.lbl_estado = tk.Label(bottom_frame, text="", bg=COLOR_FONDO, fg="#334155", font=("Segoe UI", 9))
         self.lbl_estado.pack(side=tk.LEFT, padx=20)
+
+        # --- Área de Texto Principal ---
+        text_frame = tk.Frame(self.root)
+        text_frame.pack(expand=True, fill=tk.BOTH, padx=15, pady=5)
+
+        scrollbar = tk.Scrollbar(text_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.text_area = tk.Text(text_frame, wrap=tk.WORD, font=("Georgia", 13),
+                                 yscrollcommand=scrollbar.set, relief="flat", padx=10, pady=10, height=10)
+        self.text_area.pack(expand=True, fill=tk.BOTH)
+        scrollbar.config(command=self.text_area.yview)
+
+        # Estilo para la palabra que se está leyendo
+        self.text_area.tag_configure("leyendo", background="#fde68a", foreground="#1e293b")
 
     def _estado(self, texto):
         self.lbl_estado.config(text=texto)
@@ -346,9 +451,62 @@ class AudioTextoApp:
 
         if not any("· Español" in n for n in nombres):
             if sys.platform == 'win32':
-                self._estado("No hay voces en español. Agrégalas en Configuración → Hora e idioma → Voz → Agregar voces.")
+                self.aviso_voces = "No hay voces en español en Windows (Configuración → Hora e idioma → Voz → Agregar voces)."
             else:
-                self._estado("No se encontraron voces en español en este equipo.")
+                self.aviso_voces = "No se encontraron voces en español en este equipo."
+        self._estado(self.aviso_voces)
+
+    def _al_elegir_voz(self):
+        self.voz_elegida_por_usuario = True
+        self._reiniciar_si_lee()
+
+    def _buscar_voces_en_linea(self):
+        """Revisa en segundo plano si hay internet para agregar las voces en línea."""
+        if not EN_LINEA_LIBRERIAS:
+            self._estado("Para voces en línea instala: pip install edge-tts pygame-ce")
+            return
+        self._estado("Buscando voces en línea...")
+
+        def _revisar():
+            conectado = hay_conexion()
+            try:
+                self.root.after(0, self._al_revisar_conexion, conectado)
+            except RuntimeError:
+                pass  # La ventana ya se cerró
+        threading.Thread(target=_revisar, daemon=True).start()
+
+    def _al_revisar_conexion(self, conectado):
+        if conectado:
+            # Voces en línea arriba, las de la computadora debajo
+            voces = {nombre: PREFIJO_EN_LINEA + voz for nombre, voz in VOCES_EN_LINEA}
+            voces.update(self.voces_dict)
+            self.voces_dict = voces
+            self.combo_voces['values'] = list(voces.keys())
+            if not self.voz_elegida_por_usuario and not self.hilo_activo:
+                self.combo_voces.set(VOCES_EN_LINEA[0][0])
+            mensaje = "Voces en línea disponibles."
+        else:
+            mensaje = f"Sin conexión: se usan las voces de la computadora. {self.aviso_voces}".strip()
+        if not self.hilo_activo:
+            self._estado(mensaje)
+
+    def _voz_de_respaldo(self, voz_id):
+        """Busca una voz de la computadora parecida (misma persona e idioma) a la voz en línea."""
+        nombre_en_linea = next((n for n, v in self.voces_dict.items() if v == voz_id), "")
+        locales = [(n, v) for n, v in self.voces_dict.items() if not v.startswith(PREFIJO_EN_LINEA)]
+        if not locales:
+            return None
+        persona = nombre_en_linea.split(" · ")[0]
+        idioma = nombre_en_linea.split(" · ")[1].split(" ")[0] if " · " in nombre_en_linea else ""
+        for prefijo in (f"{persona} · {idioma}", persona, ""):
+            for n, v in locales:
+                if n.startswith(prefijo):
+                    return n, v
+        return None
+
+    def _usar_respaldo(self, nombre):
+        self.combo_voces.set(nombre)
+        self._estado("No se pudo usar la voz en línea (¿sin internet?). Se usa una voz de la computadora.")
 
     # ------------------------------------------------------------------
     # Carga de archivos
@@ -477,14 +635,13 @@ class AudioTextoApp:
         velocidad = self.velocidad.get()
 
         # Iniciar hilo de lectura
-        threading.Thread(target=self._bucle_lectura_fluido,
+        threading.Thread(target=self._bucle_lectura,
                          args=(voz_id, velocidad, texto, inicio), daemon=True).start()
 
-    def _bucle_lectura_fluido(self, voz_id, velocidad, texto, inicio):
+    def _bucle_lectura(self, voz_id, velocidad, texto, inicio):
         """
-        Lee el texto de corrido para evitar bloqueos en los puntos finales.
-        Usa un evento interno del motor para resaltar cada palabra y para
-        abortar cuando presionas Pausar o Detener.
+        Hilo de lectura. Usa la voz en línea si se eligió una; si falla (por ejemplo,
+        sin internet), sigue leyendo desde la misma palabra con una voz de la computadora.
         """
         # Requerido en Windows para inicializar COM en un hilo secundario de forma segura
         if sys.platform == 'win32':
@@ -494,10 +651,100 @@ class AudioTextoApp:
             except ImportError:
                 pass
 
-        engine = None
+        try:
+            if voz_id and voz_id.startswith(PREFIJO_EN_LINEA):
+                try:
+                    self._leer_en_linea(voz_id[len(PREFIJO_EN_LINEA):], velocidad, texto, inicio)
+                    return
+                except Exception as e:
+                    print("No se pudo usar la voz en línea:", e)
+                    if not self.is_playing:
+                        return
+                    respaldo = self._voz_de_respaldo(voz_id)
+                    if not respaldo:
+                        raise
+                    nombre, voz_id = respaldo
+                    self.root.after(0, self._usar_respaldo, nombre)
+                    inicio = self.pos_actual
+            self._leer_con_voz_local(voz_id, velocidad, texto, inicio)
+
+        except Exception as e:
+            print("Error en el motor de voz:", e)
+
+        finally:
+            if sys.platform == 'win32':
+                try:
+                    import pythoncom
+                    pythoncom.CoUninitialize()
+                except ImportError:
+                    pass
+
+            self.root.after(0, self._al_terminar)
+
+    def _leer_en_linea(self, voz, velocidad, texto, inicio):
+        """
+        Lee con una voz en línea, fragmento por fragmento.
+        Mientras suena un fragmento, el siguiente se descarga en segundo plano.
+        """
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+
+        fragmentos = dividir_en_fragmentos(texto, inicio)
+        if not fragmentos:
+            return
+        descargas = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            a, b = fragmentos[0]
+            siguiente = descargas.submit(sintetizar_en_linea, texto[a:b], voz, velocidad)
+            for i, (a, b) in enumerate(fragmentos):
+                self.pos_actual = a
+                # Esperar el audio, pero sin dejar de atender Pausar/Detener
+                while True:
+                    if not self.is_playing:
+                        return
+                    try:
+                        audio, palabras = siguiente.result(timeout=0.1)
+                        break
+                    except concurrent.futures.TimeoutError:
+                        continue
+                if i + 1 < len(fragmentos):
+                    a2, b2 = fragmentos[i + 1]
+                    siguiente = descargas.submit(sintetizar_en_linea, texto[a2:b2], voz, velocidad)
+                self._reproducir(audio, ubicar_palabras(texto, a, b, palabras))
+                if not self.is_playing:
+                    return
+        finally:
+            descargas.shutdown(wait=False, cancel_futures=True)
+
+    def _reproducir(self, audio, marcas):
+        """Reproduce un fragmento y resalta cada palabra en su momento."""
+        pygame.mixer.music.load(io.BytesIO(audio), "mp3")
+        pygame.mixer.music.play()
+        siguiente_marca = 0
+        try:
+            while pygame.mixer.music.get_busy():
+                if not self.is_playing:
+                    return
+                ms = pygame.mixer.music.get_pos()
+                while siguiente_marca < len(marcas) and marcas[siguiente_marca][0] <= ms:
+                    _, posicion, largo = marcas[siguiente_marca]
+                    siguiente_marca += 1
+                    self.pos_actual = posicion
+                    self.root.after(0, self._resaltar, posicion, largo)
+                time.sleep(0.03)
+        finally:
+            pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
+
+    def _leer_con_voz_local(self, voz_id, velocidad, texto, inicio):
+        """
+        Lee con una voz de la computadora, de corrido para evitar bloqueos en los puntos finales.
+        Usa un evento interno del motor para resaltar cada palabra y para
+        abortar cuando presionas Pausar o Detener.
+        """
+        engine = pyttsx3.init()
         token = None
         try:
-            engine = pyttsx3.init()
             if voz_id:
                 try:
                     asignar_voz(engine, voz_id)
@@ -522,25 +769,12 @@ class AudioTextoApp:
             # Le pasamos TODO el texto restante de un golpe. Así lee sin pausas raras.
             engine.say(texto[inicio:])
             engine.runAndWait()
-
-        except Exception as e:
-            print("Error en el motor de voz:", e)
-
         finally:
-            if engine is not None and token is not None:
+            if token is not None:
                 try:
                     engine.disconnect(token)
                 except Exception:
                     pass
-
-            if sys.platform == 'win32':
-                try:
-                    import pythoncom
-                    pythoncom.CoUninitialize()
-                except ImportError:
-                    pass
-
-            self.root.after(0, self._al_terminar)
 
     def _resaltar(self, posicion, largo):
         if not self.is_playing:
