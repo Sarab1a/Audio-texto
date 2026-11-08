@@ -1,4 +1,4 @@
-# AudioTexto: v2 - 07/11/26
+# AudioTexto: v3 - 08/11/26
 # Este código fue escrito a fin de solucionar un problema de pereza con el cual sé
 # me es muy aburrido en ciertos puntos, el leer tanto texto. El enfoque inicial de
 # este proyecto es para textos comunes, aunque con el paso del tiempo deseo que este
@@ -300,7 +300,7 @@ def limites_palabra(texto, posicion):
 class AudioTextoApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("AudioTexto v2 - Carolina Edition")
+        self.root.title("AudioTexto v3 - Carolina Edition")
         self.root.geometry("960x640")
         self.root.configure(bg=COLOR_FONDO)
 
